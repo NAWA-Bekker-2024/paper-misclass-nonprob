@@ -47,6 +47,7 @@ pop_data[, age_m := dd$age]
 pop_data[, ethnic_m := dd$ethnic]
 
 
+
 n_sims <- 100 
 n_B <- 1000 
 n_valid <- 100 ## size of validation sample
