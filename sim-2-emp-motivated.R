@@ -4,6 +4,7 @@
 library(simex)
 library(data.table)
 library(nonprobsvy)
+library(simputation)
 
 ## classification matrices from linear and transformer (test data)
 lin_vals <- c(
@@ -19,10 +20,7 @@ lin_vals <- c(
 )
 
 lin_mat <- matrix(lin_vals, nrow = 9, ncol = 9, byrow = TRUE)
-lin_mat <- lin_mat/rowSums(lin_mat)
-lin_mat <- lin_mat[-6, -6]
-
-rownames(lin_mat) <- colnames(lin_mat) <- c("1", "2", "3", "4", "5", "7", "8", "9")
+lin_mat <- t(lin_mat[-6, -6]/rowSums(lin_mat[-6, -6]))
 
 tra_vals <- values <- c(
   75.4, 15.5, 4.3, 1.7, 2.2, 0.0, 0.4, 0.0, 0.4, 
@@ -37,66 +35,94 @@ tra_vals <- values <- c(
 )
 
 tra_mat <- matrix(tra_vals, nrow = 9, ncol = 9, byrow = TRUE)
-tra_mat <- tra_mat/rowSums(tra_mat)
-tra_mat <- tra_mat[-6, -6]
-rownames(tra_mat) <- colnames(tra_mat) <- c("1", "2", "3", "4", "5", "7", "8", "9")
+tra_mat <- t(tra_mat[-6, -6]/rowSums(tra_mat[-6, -6]))
+
 
 ## population data from the JVS
 
 pop_data <- fread("data-raw/sim-empirical-pop-data.csv")
-pop_data$size <- factor(pop_data$size, c("Small", "Medium", "Large"), ordered = T)
-
-## generate target variable, say working in on a single shift
-### more public 
-### decreases with size
-### for specific occupations: it will be significantly lower: 4, 5, 7, 8, 9
-
-pop_data[, pr_y := plogis(13 - 2*(occup_code) - 2*(size=="Large") + 1.5*(private == "Public"))]
-pop_data[, pr_peo := vac_peo/vac_total]
-pop_data_expanded <- pop_data[rep(pop_data[, .I], vac_total),.(private, size, occup_code, pr_y, pr_peo)]
+pop_data[, size := factor(size, c("Small", "Medium", "Large"))]
+pop_data_expanded <- pop_data[rep(pop_data[, .I], vac_total), .(private, size, occup_code, prob_y, prob_cbop)]
 pop_data_expanded[, occup_code:=as.factor(occup_code)]
 
-set.seed(2024)
-pop_data_expanded[, y:=rbinom(.N, 1, pr_y)]
+colnames(tra_mat) <- colnames(lin_mat) <- levels(pop_data_expanded$occup_code)
 
-vcd::assocstats(xtabs(~y+ occup_code, data = pop_data_expanded))
+## add mis-classification
+set.seed(2024)
+pop_data_expanded[, y:=rbinom(.N, 1, prob_y)]
+occup_lin <- simex::misclass(pop_data_expanded[, .(occup_code)], list(occup_code = lin_mat), k = 1)
+occup_tra <- simex::misclass(pop_data_expanded[, .(occup_code)], list(occup_code = tra_mat), k = 1)
+pop_data_expanded[, occup_code_lin := occup_lin$occup_code]
+pop_data_expanded[, occup_code_tra := occup_tra$occup_code]
+
+## for correction
+lin_mat_for_corr <- prop.table(margin = 2, xtabs(~occup_code+occup_code_lin, pop_data_expanded))
+lin_mat_for_corr[lin_mat_for_corr < 0.01] <- 0.01
+for (i in 1:ncol(lin_mat_for_corr)) lin_mat_for_corr[, i] <- lin_mat_for_corr[,i]/sum(lin_mat_for_corr[,i])
+tra_mat_for_corr <- prop.table(margin = 2, xtabs(~occup_code+occup_code_tra, pop_data_expanded))
+tra_mat_for_corr[tra_mat_for_corr < 0.01] <- 0.01
+for (i in 1:ncol(tra_mat_for_corr)) tra_mat_for_corr[, i] <- tra_mat_for_corr[,i]/sum(tra_mat_for_corr[,i])
+
+
+y_true <- mean(pop_data_expanded$y)
+
 vcd::assocstats(xtabs(~y+ size, data = pop_data_expanded))
 vcd::assocstats(xtabs(~y+ private, data = pop_data_expanded))
 
-m1 <- glm(y~ occup_code+size+private,data=pop_data_expanded, family = binomial())
+vcd::assocstats(xtabs(~y+ occup_code, data = pop_data_expanded))
+vcd::assocstats(xtabs(~y+ occup_code_lin, data = pop_data_expanded))
+vcd::assocstats(xtabs(~y+ occup_code_tra, data = pop_data_expanded))
+
 
 ## simulation
-R <- 500
-results <- matrix(0, nrow = R, ncol = 10, 
+R <- 50
+B_simex <- 50
+results <- matrix(0, nrow = R, ncol = 18, 
                   dimnames = list(NULL, 
                                   c("naive", 
                                     "ipw", "mi", "dr",
                                     "ipw_lin", "mi_lin", "dr_lin",
-                                    "ipw_tra", "mi_tra", "dr_tra")))
+                                    "ipw_tra", "mi_tra", "dr_tra",
+                                    "ipw_lin_cor", "mi_lin_cor", "dr_lin_cor",
+                                    "ipw_tra_cor", "mi_tra_cor", "dr_tra_cor",
+                                    "mi_li", "mi_q")))
+
+results_ci <- matrix(0, nrow = R, ncol = 17, 
+                  dimnames = list(NULL, 
+                                  c("ipw", "mi", "dr",
+                                    "ipw_lin", "mi_lin", "dr_lin",
+                                    "ipw_tra", "mi_tra", "dr_tra",
+                                    "ipw_lin_cor", "mi_lin_cor", "dr_lin_cor",
+                                    "ipw_tra_cor", "mi_tra_cor", "dr_tra_cor",
+                                    "mi_li", "mi_q")))
 
 for (r in 1:R) {
   set.seed(r)
-  pop_data_expanded[, cbop:=rbinom(.N, 1, pr_peo)] 
+  if (r %% 50 == 0) print(r)
+  pop_data_expanded[, cbop:=rbinom(.N, 1, prob_cbop)] 
   cbop_data <- pop_data_expanded[cbop == 1]
   prob_sample <- pop_data_expanded[sample(1:.N, 1000)]
   prob_sample[, weights:=nrow(pop_data_expanded)/1000]
+  prob_sample[, ":="(occup_code_lin=NULL, occup_code_tra=NULL)]
+  
+  ## imputation based mis-classification matrix 
+  occup_lin <- simex::misclass(prob_sample[, .(occup_code)], list(occup_code = lin_mat), k = 1)
+  occup_tra <- simex::misclass(prob_sample[, .(occup_code)], list(occup_code = tra_mat), k = 1)
+  prob_sample_lin <- copy(prob_sample)
+  prob_sample_lin[, occup_code := occup_lin$occup_code]
+  prob_sample_tra <- copy(prob_sample)
+  prob_sample_tra[, occup_code := occup_tra$occup_code]
+  
   prob_sample_svy <- svydesign(ids=~1, data=prob_sample, weights= ~ weights)
-  
-  cbop_copy_lin <- copy(cbop_data)
-  cbop_copy_tra <- copy(cbop_data)
-  
-  occup_lin <- simex::misclass(cbop_copy_lin[, .(occup_code)], list(occup_code = lin_mat), k = 1)
-  occup_tra <- simex::misclass(cbop_copy_tra[, .(occup_code)], list(occup_code = tra_mat), k = 1)
-  
-  cbop_copy_lin[, occup_code := occup_lin$occup_code]
-  cbop_copy_tra[, occup_code := occup_tra$occup_code]
+  prob_sample_lin_svy <- svydesign(ids=~1, data=prob_sample_lin, weights= ~ weights)
+  prob_sample_tra_svy <- svydesign(ids=~1, data=prob_sample_tra, weights= ~ weights)
   
   ## original
   res_ipw_cal <- nonprob(data = cbop_data, 
                          selection = ~ private + size + occup_code, 
                          svydesign = prob_sample_svy, 
                          target = ~y, 
-                         , control_selection = controlSel(est_method_sel = "gee")
+                         #, control_selection = controlSel(est_method_sel = "gee")
                          )
   
   res_mi <- nonprob(data = cbop_data, 
@@ -109,79 +135,176 @@ for (r in 1:R) {
                     selection = ~ private + size + occup_code, 
                     svydesign = prob_sample_svy,
                     method_outcome = "glm", family_outcome = "binomial",
-                    , control_selection = controlSel(est_method_sel = "gee")
+                    #, control_selection = controlSel(est_method_sel = "gee")
                     )
   
   ## with mis-class (linear)
-  res_ipw_cal_lin <- nonprob(data = cbop_copy_lin, 
+  res_ipw_cal_lin <- nonprob(data = cbop_data[, .(y,private,size,occup_code=occup_code_lin)], 
                          selection = ~ private + size + occup_code, 
                          svydesign = prob_sample_svy, 
                          target = ~y
-                         , control_selection = controlSel(est_method_sel = "gee")
+                         #, control_selection = controlSel(est_method_sel = "gee")
                          )
   
-  res_mi_lin <- nonprob(data = cbop_copy_lin, 
+  res_mi_lin <- nonprob(data = cbop_data[, .(y,private,size,occup_code=occup_code_lin)], 
                     outcome = y ~ private + size + occup_code, 
                     svydesign = prob_sample_svy,
                     method_outcome = "glm", family_outcome = "binomial")
   
-  res_dr_lin <- nonprob(data = cbop_copy_lin, 
+  res_dr_lin <- nonprob(data = cbop_data[, .(y,private,size,occup_code=occup_code_lin)], 
                     outcome = y ~ private + size + occup_code, 
                     selection = ~ private + size + occup_code, 
                     svydesign = prob_sample_svy,
                     method_outcome = "glm", family_outcome = "binomial"
-                    , control_selection = controlSel(est_method_sel = "gee")
+                    #, control_selection = controlSel(est_method_sel = "gee")
   )
   
   ## with mis-class (transformer)
-  res_ipw_cal_tra <- nonprob(data = cbop_copy_tra, 
+  res_ipw_cal_tra <- nonprob(data = cbop_data[, .(y,private,size,occup_code=occup_code_tra)], 
                              selection = ~ private + size + occup_code, 
                              svydesign = prob_sample_svy, 
                              target = ~y
-                             , control_selection = controlSel(est_method_sel = "gee")
+                             #, control_selection = controlSel(est_method_sel = "gee")
   )
   
-  res_mi_tra <- nonprob(data = cbop_copy_tra, 
+  res_mi_tra <- nonprob(data = cbop_data[, .(y,private,size,occup_code=occup_code_tra)], 
                         outcome = y ~ private + size + occup_code, 
                         svydesign = prob_sample_svy,
                         method_outcome = "glm", family_outcome = "binomial")
   
-  res_dr_tra <- nonprob(data = cbop_copy_tra, 
+  res_dr_tra <- nonprob(data = cbop_data[, .(y,private,size,occup_code=occup_code_tra)], 
                         outcome = y ~ private + size + occup_code, 
                         selection = ~ private + size + occup_code, 
                         svydesign = prob_sample_svy,
                         method_outcome = "glm", family_outcome = "binomial"
-                        , control_selection = controlSel(est_method_sel = "gee")
+                        #, control_selection = controlSel(est_method_sel = "gee")
   )
   
   
+  ## correct for measurement error using known matrix (generate data based on matrix)
+  #occup_lin_corr <- simex::misclass(cbop_data[, .(occup_code_lin)], list(occup_code_lin = lin_mat_for_corr), k = 1)
+  #occup_tra_corr <- simex::misclass(cbop_data[, .(occup_code_tra)], list(occup_code_tra = tra_mat_for_corr), k = 1)
+  #cbop_data[, occup_code_lin_corr := occup_lin_corr$occup_code_lin]
+  #cbop_data[, occup_code_tra_corr := occup_tra_corr$occup_code_tra]
   
+  ## estimators after correction (linear)
+  res_ipw_cal_lin_cor <- nonprob(data = cbop_data,#[, .(y,private,size,occup_code=occup_code_lin_corr)], 
+                             selection = ~ private + size + occup_code, 
+                             svydesign = prob_sample_lin_svy, 
+                             target = ~y
+                             #, control_selection = controlSel(est_method_sel = "gee")
+  )
+  
+  res_mi_lin_cor <- nonprob(data = cbop_data,#[, .(y,private,size,occup_code=occup_code_lin_corr)], 
+                        outcome = y ~ private + size + occup_code, 
+                        svydesign = prob_sample_lin_svy,
+                        method_outcome = "glm", family_outcome = "binomial")
+  
+  res_dr_lin_cor <- nonprob(data = cbop_data,#[, .(y,private,size,occup_code=occup_code_lin_corr)], 
+                        outcome = y ~ private + size + occup_code, 
+                        selection = ~ private + size + occup_code, 
+                        svydesign = prob_sample_lin_svy,
+                        method_outcome = "glm", family_outcome = "binomial"
+                        #, control_selection = controlSel(est_method_sel = "gee")
+  )
+  
+  ## estimators after correction (transformer)
+  res_ipw_cal_tra_cor <- nonprob(data = cbop_data,#[, .(y,private,size,occup_code=occup_code_tra_corr)], 
+                             selection = ~ private + size + occup_code, 
+                             svydesign = prob_sample_tra_svy, 
+                             target = ~y
+                             #, control_selection = controlSel(est_method_sel = "gee")
+  )
+  
+  res_mi_tra_cor <- nonprob(data = cbop_data,#[, .(y,private,size,occup_code=occup_code_tra_corr)], 
+                        outcome = y ~ private + size + occup_code, 
+                        svydesign = prob_sample_tra_svy,
+                        method_outcome = "glm", family_outcome = "binomial")
+  
+  res_dr_tra_cor <- nonprob(data = cbop_data,#[, .(y,private,size,occup_code=occup_code_tra_corr)], 
+                        outcome = y ~ private + size + occup_code, 
+                        selection = ~ private + size + occup_code, 
+                        svydesign = prob_sample_tra_svy,
+                        method_outcome = "glm", family_outcome = "binomial"
+                        #, control_selection = controlSel(est_method_sel = "gee")
+  )
+  
+  
+  # ## model parameters corrected by MC-SIMEX approach
+
+  mi_lin_m1 <- glm(data = cbop_data[, .(y,private,size,occup_code=occup_code_lin)], 
+  formula = y ~ private + size + occup_code, family= "binomial")
+  
+  res_mi_lin_simex_l <- simex::mcsimex(model = mi_lin_m1, 
+                                       mc.matrix = list(occup_code = lin_mat_for_corr), 
+                                       SIMEXvariable = c("occup_code"), fitting.method	= "linear", asymptotic = FALSE, 
+                                       lambda = c(0.01, 0.05, 0.1), 
+                                       jackknife.estimation	= FALSE, B = B_simex)
+
+  res_mi_lin_simex_q <- refit(object = res_mi_lin_simex_l, 
+                              fitting.method = "quadratic", 
+                              asymptotic = FALSE, 
+                              jackknife.estimation	= FALSE)
+  
+  prob_sample_svy <- update(prob_sample_svy,
+                    y_li = predict(res_mi_lin_simex_l, prob_sample_svy$variables, type = "response"),
+                    y_qu = predict(res_mi_lin_simex_q, prob_sample_svy$variables, type = "response"))
+  
+  res <- svymean(~y_li + y_qu, design = prob_sample_svy)
+  res_ci <- confint(res)
   
   results[r, 1] <- mean(cbop_data$y)
   
   results[r, 2] <- res_ipw_cal$output$mean
   results[r, 3] <- res_mi$output$mean
   results[r, 4] <- res_dr$output$mean
-  
   results[r, 5] <- res_ipw_cal_lin$output$mean
   results[r, 6] <- res_mi_lin$output$mean
   results[r, 7] <- res_dr_lin$output$mean
-  
   results[r, 8] <- res_ipw_cal_tra$output$mean
   results[r, 9] <- res_mi_tra$output$mean
   results[r, 10] <- res_dr_tra$output$mean
+  results[r, 11] <- res_ipw_cal_lin_cor$output$mean
+  results[r, 12] <- res_mi_lin_cor$output$mean
+  results[r, 13] <- res_dr_lin_cor$output$mean
+  results[r, 14] <- res_ipw_cal_tra_cor$output$mean
+  results[r, 15] <- res_mi_tra_cor$output$mean
+  results[r, 16] <- res_dr_tra_cor$output$mean
+  results[r, 17] <- res[1]
+  results[r, 18] <- res[2]
+  
+  
+  results_ci[r, 1] <- res_ipw_cal$confidence_interval[1] < y_true & res_ipw_cal$confidence_interval[2] > y_true
+  results_ci[r, 2] <- res_mi$confidence_interval[1] < y_true & res_mi$confidence_interval[2] > y_true
+  results_ci[r, 3] <- res_dr$confidence_interval[1] < y_true & res_dr$confidence_interval[2] > y_true
+  results_ci[r, 4] <- res_ipw_cal_lin$confidence_interval[1] < y_true & res_ipw_cal_lin$confidence_interval[2] > y_true
+  results_ci[r, 5] <- res_mi_lin$confidence_interval[1] < y_true & res_mi_lin$confidence_interval[2] > y_true
+  results_ci[r, 6] <- res_dr_lin$confidence_interval[1] < y_true & res_dr_lin$confidence_interval[2] > y_true
+  results_ci[r, 7] <- res_ipw_cal_tra$confidence_interval[1] < y_true & res_ipw_cal_tra$confidence_interval[2] > y_true
+  results_ci[r, 8] <- res_mi_tra$confidence_interval[1] < y_true & res_mi_tra$confidence_interval[2] > y_true
+  results_ci[r, 9] <- res_dr_tra$confidence_interval[1] < y_true & res_dr_tra$confidence_interval[2] > y_true
+  results_ci[r, 10] <- res_ipw_cal_lin_cor$confidence_interval[1] < y_true & res_ipw_cal_lin_cor$confidence_interval[2] > y_true
+  results_ci[r, 11] <- res_mi_lin_cor$confidence_interval[1] < y_true & res_mi_lin_cor$confidence_interval[2] > y_true
+  results_ci[r, 12] <- res_dr_lin_cor$confidence_interval[1] < y_true & res_dr_lin_cor$confidence_interval[2] > y_true
+  results_ci[r, 13] <- res_ipw_cal_tra_cor$confidence_interval[1] < y_true & res_ipw_cal_tra_cor$confidence_interval[2] > y_true
+  results_ci[r, 14] <- res_mi_tra_cor$confidence_interval[1] < y_true & res_mi_tra_cor$confidence_interval[2] > y_true
+  results_ci[r, 15] <- res_dr_tra_cor$confidence_interval[1] < y_true & res_dr_tra_cor$confidence_interval[2] > y_true
+  results_ci[r, 16] <- res_ci[1,1] < y_true & res_ci[1,2] > y_true
+  results_ci[r, 17] <- res_ci[2,1] < y_true & res_ci[2,2] > y_true
   
 }
 
-boxplot(results[1:(r-1),]- mean(pop_data_expanded$y))
+boxplot(results[1:(r-1),]- y_true)
 abline(h=0,col = "red")
 
+colMeans(results_ci)
 
 
-
-
-## nonprob
-
-
+## 
+bias <- colMeans(results) - y_true
+var <- apply(results, 2, var)
+rmse <- sqrt(bias^2+var)
+data.frame(bias,var, rmse)
+round(bias/y_true*100,2)
 
 
